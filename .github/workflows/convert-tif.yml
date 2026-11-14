@@ -1,0 +1,276 @@
+# Simpan sebagai: .github/workflows/convert-tif.yml
+#
+# Mengubah TIFF (8-bit atau 16-bit) jadi JPG atau PNG yang bisa dibuka di galeri HP.
+# Resolusi tidak diubah sama sekali (1:1). Panduan lengkap: README-convert-tif.md
+
+name: Convert TIF
+
+on:
+  workflow_dispatch:
+    inputs:
+      sumber:
+        description: "Ambil TIFF dari mana?"
+        type: choice
+        default: file-di-repo
+        options:
+          - file-di-repo
+          - artifact-run-sebelumnya
+      path:
+        description: "Dipakai kalau sumber = file-di-repo. File .tif atau folder, mis. sesi1/DSC-0042.tif atau sesi1"
+        required: false
+        default: ""
+        type: string
+      run_id:
+        description: "Dipakai kalau sumber = artifact-run-sebelumnya. Angka di URL run, mis. 123456789"
+        required: false
+        default: ""
+        type: string
+      filter:
+        description: "Opsional: hanya file yang namanya mengandung teks ini, mis. starreduce2"
+        required: false
+        default: ""
+        type: string
+      kualitas:
+        description: "Format dan kualitas"
+        type: choice
+        default: jpg-100
+        options:
+          - jpg-100
+          - jpg-95
+          - png-lossless
+      commit_back:
+        description: "Simpan hasil ke folder hasil-jpg/ di repo (gampang dibuka dari app GitHub)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: convert-tif
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # untuk commit_back
+      actions: read     # untuk mengunduh artifact dari run sebelumnya
+
+    steps:
+      - name: Ambil repo
+        uses: actions/checkout@v4
+
+      - name: Cek input
+        shell: bash
+        env:
+          SUMBER: ${{ inputs.sumber }}
+          PATH_IN: ${{ inputs.path }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          if [[ "$SUMBER" == "artifact-run-sebelumnya" ]]; then
+            if [[ ! "$RUN_ID" =~ ^[0-9]{1,20}$ ]]; then
+              echo "::error::run_id harus angka saja (ambil dari URL halaman run: .../actions/runs/<angka>)"; exit 1
+            fi
+          else
+            if [[ -z "$PATH_IN" ]]; then
+              echo "::error::Isi kolom path (file .tif atau folder di repo)"; exit 1
+            fi
+          fi
+
+      - name: Unduh artifact dari run sebelumnya
+        if: ${{ inputs.sumber == 'artifact-run-sebelumnya' }}
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: _artifact
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependensi
+        run: python -m pip install numpy tifffile pillow imagecodecs
+
+      - name: Konversi
+        id: conv
+        shell: bash
+        env:
+          SUMBER: ${{ inputs.sumber }}
+          PATH_IN: ${{ inputs.path }}
+          FILTER: ${{ inputs.filter }}
+          KUALITAS: ${{ inputs.kualitas }}
+          OUTDIR: hasil-jpg
+        run: |
+          mkdir -p "$OUTDIR"
+          python - <<'PY'
+          import os, re, sys
+          import numpy as np
+          import tifffile
+          from PIL import Image, ImageFile
+
+          # buffer encoder JPEG harus cukup besar untuk seluruh file saat optimize=True,
+          # kalau tidak Pillow gagal ("Suspension not allowed here") di gambar beresolusi/noise tinggi
+          ImageFile.MAXBLOCK = 2 ** 27
+
+          sumber = os.environ["SUMBER"]
+          path_in = os.environ.get("PATH_IN", "").strip()
+          flt = os.environ.get("FILTER", "").strip()
+          kual = os.environ["KUALITAS"]
+          outdir = os.environ["OUTDIR"]
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          EXTS = (".tif", ".tiff")
+
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+
+          # ---------- cari file ----------
+          if not re.fullmatch(r"[A-Za-z0-9_.-]*", flt):
+              fail("filter hanya boleh huruf, angka, _ . -")
+          files = []
+          if sumber == "artifact-run-sebelumnya":
+              for root, _, names in os.walk("_artifact"):
+                  for n in sorted(names):
+                      if n.lower().endswith(EXTS):
+                          files.append(os.path.join(root, n))
+          else:
+              if path_in.startswith("/") or ".." in path_in.split("/") \
+                      or not re.fullmatch(r"[A-Za-z0-9_./ -]+", path_in):
+                  fail("path tidak valid")
+              path_in = path_in.rstrip("/")
+              if os.path.isfile(path_in):
+                  if not path_in.lower().endswith(EXTS):
+                      fail(f"'{path_in}' bukan file .tif atau .tiff")
+                  files = [path_in]
+              elif os.path.isdir(path_in):
+                  files = [os.path.join(path_in, n) for n in sorted(os.listdir(path_in))
+                           if n.lower().endswith(EXTS)]
+              else:
+                  fail(f"'{path_in}' tidak ada di repo")
+          if flt:
+              files = [f for f in files if flt.lower() in os.path.basename(f).lower()]
+          if not files:
+              fail("Tidak ada file .tif/.tiff yang cocok. Cek path, run_id, atau filter.")
+          print(f"{len(files)} file akan dikonversi")
+
+
+          # ---------- konversi ----------
+          def to_uint8(a):
+              if a.dtype == np.uint8:
+                  return a
+              if a.dtype == np.uint16:
+                  # skala 0..65535 -> 0..255 dengan pembulatan (bukan dipotong)
+                  return ((a.astype(np.uint32) * 255 + 32767) // 65535).astype(np.uint8)
+              if a.dtype.kind == "f":
+                  return (np.clip(a, 0, 1) * 255.0 + 0.5).astype(np.uint8)
+              raise ValueError(f"tipe data {a.dtype} belum didukung (hanya 8-bit, 16-bit, float)")
+
+
+          def read_tiff(path):
+              a = tifffile.imread(path, key=0)  # halaman pertama saja
+              a = np.squeeze(a)
+              if a.ndim == 3 and a.shape[0] in (2, 3, 4) and a.shape[2] not in (2, 3, 4):
+                  a = np.transpose(a, (1, 2, 0))  # planar -> interleaved
+              if a.ndim == 3:
+                  if a.shape[2] == 2:
+                      a = a[..., 0]        # gray + alpha
+                  elif a.shape[2] >= 3:
+                      a = a[..., :3]       # buang alpha
+                  else:
+                      a = a[..., 0]
+              if a.ndim not in (2, 3):
+                  raise ValueError(f"bentuk data {a.shape} tidak didukung")
+              icc = None
+              try:
+                  with tifffile.TiffFile(path) as t:
+                      tag = t.pages[0].tags.get(34675)
+                      if tag is not None:
+                          icc = bytes(tag.value)
+              except Exception:
+                  pass
+              return a, icc
+
+
+          def psnr(a8, b8):
+              se, n = 0.0, 0
+              step = 256
+              for i in range(0, a8.shape[0], step):
+                  d = a8[i:i + step].astype(np.int32) - b8[i:i + step].astype(np.int32)
+                  se += float(np.sum(d.astype(np.int64) ** 2))
+                  n += d.size
+              mse = se / max(n, 1)
+              return float("inf") if mse == 0 else 10 * np.log10(255.0 ** 2 / mse)
+
+
+          os.makedirs(outdir, exist_ok=True)
+          used = set()
+          rows, failed = [], []
+          ext = ".png" if kual.startswith("png") else ".jpg"
+          for path in files:
+              stem = os.path.splitext(os.path.basename(path))[0]
+              name, k = stem, 2
+              while name in used:
+                  name, k = f"{stem}_{k}", k + 1
+              used.add(name)
+              out = os.path.join(outdir, name + ext)
+              try:
+                  a, icc = read_tiff(path)
+                  src_dtype = str(a.dtype)
+                  a8 = to_uint8(a)
+                  del a
+                  im = Image.fromarray(a8)
+                  if kual.startswith("jpg"):
+                      q = int(kual.split("-")[1])
+                      # subsampling=0 -> 4:4:4, warna tidak diperkecil
+                      try:
+                          im.save(out, "JPEG", quality=q, subsampling=0, optimize=True, icc_profile=icc)
+                      except OSError:
+                          # cadangan: tanpa optimize (file sedikit lebih besar, kualitas sama)
+                          im.save(out, "JPEG", quality=q, subsampling=0, icc_profile=icc)
+                  else:
+                      im.save(out, "PNG", icc_profile=icc)
+                  dec = np.asarray(Image.open(out).convert(im.mode))
+                  p = psnr(a8, dec)
+                  p_txt = "identik" if p == float("inf") else f"{p:.1f} dB"
+                  h, w = a8.shape[:2]
+                  size_mb = os.path.getsize(out) / 1e6
+                  in_mb = os.path.getsize(path) / 1e6
+                  print(f"OK  {path} ({src_dtype}, {w}x{h}) -> {out}  {in_mb:.1f} MB -> {size_mb:.1f} MB, kemiripan {p_txt}")
+                  rows.append((os.path.basename(path), f"{w}x{h}", src_dtype, f"{in_mb:.1f}", os.path.basename(out), f"{size_mb:.1f}", p_txt))
+              except Exception as e:
+                  print(f"::error::{path}: {e}")
+                  failed.append(path)
+
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(f"## Convert TIF ({kual})\n\n")
+                  if rows:
+                      f.write("| Input | Ukuran | Tipe | MB | Hasil | MB | Kemiripan |\n| --- | --- | --- | --- | --- | --- | --- |\n")
+                      for r in rows:
+                          f.write("| " + " | ".join(r) + " |\n")
+                  if failed:
+                      f.write("\nGagal: " + ", ".join(f"`{x}`" for x in failed) + "\n")
+                  f.write("\nKemiripan = PSNR antara gambar 8-bit sebelum dan sesudah disimpan. "
+                          "Di atas 45 dB, perbedaannya tidak terlihat mata.\n")
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Upload hasil
+        uses: actions/upload-artifact@v4
+        with:
+          name: hasil-jpg-${{ github.run_id }}
+          path: hasil-jpg/
+          retention-days: 30
+
+      - name: Simpan hasil ke repo
+        if: ${{ inputs.commit_back }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f hasil-jpg
+          git commit -m "convert: hasil-jpg dari run ${{ github.run_id }}" || echo "Tidak ada perubahan"
+          git pull --rebase --autostash || true
+          git push
